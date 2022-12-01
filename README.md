@@ -2,6 +2,18 @@
 
 This is column-wise apply filter and utility process module
 
+If you want to compare multiple of filtering methods with automatically filter the data inside of class or funcition,
+
+this library will quite good for you
+
+in case of hampel filter, you can make it run as cuda or other device
+
+and torch apply along axis has been coded in here
+
+but as I find out, m1 macos did not supported gpu calculation yet
+
+but still there are no problem
+
 :warning: Warning Butterworth may not work fluently
 
 ## How to use
