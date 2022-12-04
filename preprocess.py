@@ -1,5 +1,6 @@
 import numpy as np
 import torch as tc
+import os
 from scipy.signal import savgol_filter
 import statsmodels.api as sm
 from scipy.signal import butter, lfilter
@@ -75,22 +76,25 @@ class Lfiltering(PreprocessingFiltering):
 class SavgolFiltering(PreprocessingFiltering):
     def __init__(self, data=None):
         super().__init__(data)
-        self.window_length, self.polyorder = 1001, 2
+        self.window_size, self.polyorder = 1001, 2
 
     def __name__(self):
         return 'SavgolFiltering'
 
-    def __condition__(self, window_length=None, polyorder=None):
-        if window_length:
-            self.window_length = window_length
+    def __condition__(self, window_size=None, polyorder=None):
+        if window_size:
+            self.window_size = window_size
         if polyorder:
             self.polyorder = polyorder
-        return f'{self.__name__}: window_length = {self.window_length}, polyorder = {self.polyorder}'
+        return f'{self.__name__}: window_size = {self.window_size}, polyorder = {self.polyorder}'
+
+    def np_savgol(self, data):
+        return np.apply_along_axis(lambda x: savgol_filter(x, self.window_size, self.polyorder), 0, data)
 
     def filtering(self, data=None):
         if data is not None:
             self.data = data
-        return np.apply_along_axis(lambda x: savgol_filter(x, self.window_length, self.polyorder), 0, self.data)
+        return np.apply_along_axis(lambda x: savgol_filter(x, self.window_size, self.polyorder), 0, self.data)
 
 
 class SmOLS(PreprocessingFiltering):
@@ -113,7 +117,7 @@ class SmOLS(PreprocessingFiltering):
 
 
 class HampelFiltering(PreprocessingFiltering):
-    def __init__(self, data=None, windows_size=100, n_sigmas=2, percentile=0.75, torch=False, device='cpu'):
+    def __init__(self, data=None, windows_size=100, n_sigmas=2, percentile=0.75, device=None):
         '''
         :param data: input data
         '''
@@ -121,22 +125,22 @@ class HampelFiltering(PreprocessingFiltering):
         self.window_size = windows_size
         self.n_sigmas = n_sigmas
         self.percentile = percentile
-        self.torch = torch
         self.device = device
 
     def __name__(self):
         return 'HampelFiltering'
 
-    def __condition__(self, window_size=None, n_sigmas=None, percentile=None, torch=False, device='cpu'):
+    def __condition__(self, window_size=None, n_sigmas=None, percentile=None, device=None):
+
         if window_size:
             self.window_size = window_size
         if n_sigmas:
             self.n_sigmas = n_sigmas
         if percentile:
             self.percentile = percentile
-        self.torch = torch
-        self.device = device
-        return f'{self.__name__}: window_size = {self.window_size}, n_sigmas = {self.n_sigmas}, percentile = {self.percentile}, torch = {self.torch}, device = {self.device}'
+        if device:
+            self.device = device
+        return f'{self.__name__}: window_size = {self.window_size}, n_sigmas = {self.n_sigmas}, percentile = {self.percentile}, device = {self.device}'
 
     def hampel(self, x, window_size, n_sigmas):
         """
@@ -160,10 +164,11 @@ class HampelFiltering(PreprocessingFiltering):
         x[outliers] = medians[outliers]
         return x
 
-    def tc_hampel(self, x, window_size, n_sigmas):
+    def tc_hampel(self, data, window_size, n_sigmas):
+        import time
         """
         Hampel filter for outlier detection
-        :param x: input data
+        :param data: input data
         :param window_size: window size
         :param n_sigmas: number of sigmas
         :return: filtered data
@@ -171,28 +176,38 @@ class HampelFiltering(PreprocessingFiltering):
         k = 1/norm.ppf(self.percentile)
         if window_size % 2 == 0:
             window_size += 1
-        x_pad = tc.nn.functional.pad(x.reshape(
-            1, -1), (window_size//2, window_size//2), mode='replicate').reshape(-1)
-        medians = tc.tensor([tc.median(x_pad[i:i+window_size])
-                             for i in range(len(x))]).to(self.device)
-        diff = tc.abs(medians - x).to(self.device)
-        med_abs_deviation = tc.tensor(
-            [tc.median(diff[i:i+window_size]) for i in range(len(x))]).to(self.device)
+        if data.device.type == 'mps':
+            data_pad = tc.nn.functional.pad(data.cpu().reshape(
+                1, -1), (window_size//2, window_size//2), mode='replicate').reshape(-1)
+        else:
+            data_pad = tc.nn.functional.pad(data.reshape(
+                1, -1), (window_size//2, window_size//2), mode='replicate').reshape(-1)
+        medians = tc.tensor([tc.median(data_pad[i:i+window_size])
+                            for i in range(len(data))]).to(self.device)
+        diff = tc.abs(medians - data).to(self.device)
+        if self.device.type == 'mps':
+            med_abs_deviation = tc.tensor(
+                [tc.median(diff.cpu()[i:i+window_size]) for i in range(len(data))]).to(self.device)
+        else:
+            med_abs_deviation = tc.tensor(
+                [tc.median(diff[i:i+window_size]) for i in range(len(data))]).to(self.device)
         threshold = n_sigmas * k * med_abs_deviation
         outliers = diff > threshold
-        x[outliers] = medians[outliers]
-        return x
+        if self.device.type == 'mps':
+            data = data.cpu()
+            data[outliers.cpu()] = medians.cpu()[outliers.cpu()]
+            data.to(self.device)
+        else:
+            data[outliers] = medians[outliers]
+        return data
 
     def filtering(self, data=None):
         if data is not None:
             self.data = data
-        if self.device.type == 'mps':
+        if self.device == 'mps':
             self.data = self.data.cpu().numpy()
-            results = np.apply_along_axis(lambda x: self.hampel(
-                x, self.window_size, self.n_sigmas), 0, self.data)
-            results = tc.from_numpy(results).to(self.device)
-            return results
-        if self.torch:
+            return np.apply_along_axis(lambda x: self.tc_hampel(tc.Tensor(x, device=self.device), self.window_size, self.n_sigmas), 0, self.data)
+        elif self.device:
             return torch_apply_along_axis(lambda x: self.tc_hampel(x, self.window_size, self.n_sigmas), 1, self.data)
         else:
             return np.apply_along_axis(lambda x: self.hampel(x, self.window_size, self.n_sigmas), 0, self.data)
